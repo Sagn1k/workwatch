@@ -30,6 +30,42 @@ success() { echo -e "${GREEN}✅${NC} $1"; }
 warn() { echo -e "${YELLOW}⚠${NC} $1"; }
 error() { echo -e "${RED}❌${NC} $1"; exit 1; }
 
+# ── Fallback: install from source ─────────────────────────────────
+
+install_from_source() {
+    info "Installing from source using pip..."
+
+    if ! command -v python3 &>/dev/null; then
+        error "Python 3 is required for source install but was not found."
+    fi
+
+    PYTHON_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+    info "Found Python ${PYTHON_VERSION}"
+
+    # Clone or download source
+    if command -v git &>/dev/null; then
+        info "Cloning WorkWatch repository..."
+        git clone --depth 1 https://github.com/sagnikb7/workwatch.git "${TEMP_DIR}/workwatch-src" 2>/dev/null || {
+            error "Failed to clone repository."
+        }
+    else
+        info "Downloading source archive..."
+        if [[ "$DOWNLOADER" == "curl" ]]; then
+            curl -fsSL -o "${TEMP_DIR}/source.tar.gz" "https://github.com/sagnikb7/workwatch/archive/refs/tags/v${VERSION}.tar.gz"
+        else
+            wget -q -O "${TEMP_DIR}/source.tar.gz" "https://github.com/sagnikb7/workwatch/archive/refs/tags/v${VERSION}.tar.gz"
+        fi
+        tar -xzf "${TEMP_DIR}/source.tar.gz" -C "${TEMP_DIR}"
+        mv "${TEMP_DIR}/workwatch-${VERSION}" "${TEMP_DIR}/workwatch-src"
+    fi
+
+    cd "${TEMP_DIR}/workwatch-src"
+    pip3 install . --quiet 2>/dev/null || pip3 install . --user --quiet
+    success "WorkWatch installed from source via pip."
+}
+
+# ── Main installer ────────────────────────────────────────────────
+
 echo ""
 echo -e "${CYAN}╔══════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}║${NC}     ${BOLD}WorkWatch Installer v${VERSION}${NC}            ${CYAN}║${NC}"
@@ -150,38 +186,3 @@ echo ""
 echo -e "  Config: ${BOLD}~/.workwatch.json${NC} (auto-created on first run)"
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
-
-
-# ── Fallback: install from source ─────────────────────────────────
-
-install_from_source() {
-    info "Installing from source using pip..."
-
-    if ! command -v python3 &>/dev/null; then
-        error "Python 3 is required for source install but was not found."
-    fi
-
-    PYTHON_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-    info "Found Python ${PYTHON_VERSION}"
-
-    # Clone or download source
-    if command -v git &>/dev/null; then
-        info "Cloning WorkWatch repository..."
-        git clone --depth 1 https://github.com/sagnikb7/workwatch.git "${TEMP_DIR}/workwatch-src" 2>/dev/null || {
-            error "Failed to clone repository."
-        }
-    else
-        info "Downloading source archive..."
-        if [[ "$DOWNLOADER" == "curl" ]]; then
-            curl -fsSL -o "${TEMP_DIR}/source.tar.gz" "https://github.com/sagnikb7/workwatch/archive/refs/tags/v${VERSION}.tar.gz"
-        else
-            wget -q -O "${TEMP_DIR}/source.tar.gz" "https://github.com/sagnikb7/workwatch/archive/refs/tags/v${VERSION}.tar.gz"
-        fi
-        tar -xzf "${TEMP_DIR}/source.tar.gz" -C "${TEMP_DIR}"
-        mv "${TEMP_DIR}/workwatch-${VERSION}" "${TEMP_DIR}/workwatch-src"
-    fi
-
-    cd "${TEMP_DIR}/workwatch-src"
-    pip3 install . --quiet 2>/dev/null || pip3 install . --user --quiet
-    success "WorkWatch installed from source via pip."
-}

@@ -6,7 +6,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=['workwatch', 'workwatch.config', 'workwatch.mail_reader', 'workwatch.parser', 'workwatch.timer', 'workwatch.log_display'],
+    hiddenimports=['workwatch', 'workwatch.config', 'workwatch.mail_reader', 'workwatch.parser', 'workwatch.timer', 'workwatch.log_display', 'workwatch.daemon', 'workwatch.notifier'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -32,7 +32,7 @@ exe = EXE(
     console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch='universal2',
+    target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
 )

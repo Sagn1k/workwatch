@@ -34,8 +34,17 @@ echo ""
 
 # ── Build ─────────────────────────────────────────────────────────
 
+VENV_DIR="${PROJECT_DIR}/.venv-build"
+
+if [[ ! -d "$VENV_DIR" ]]; then
+    info "Creating build virtualenv..."
+    python3 -m venv "$VENV_DIR"
+fi
+
+source "${VENV_DIR}/bin/activate"
+
 info "Installing build dependencies..."
-pip3 install pyinstaller --quiet
+pip install pyinstaller --quiet
 
 info "Building binary..."
 pyinstaller workwatch.spec --clean --noconfirm 2>&1 | tail -3

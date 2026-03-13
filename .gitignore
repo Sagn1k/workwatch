@@ -8,6 +8,7 @@ release/
 *.spec.bak
 .eggs/
 .venv/
+.venv-build/
 venv/
 env/
 *.DS_Store
