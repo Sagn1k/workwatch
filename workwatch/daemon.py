@@ -1,0 +1,289 @@
+"""Background daemon mode for WorkWatch.
+
+Forks into background, sleeps until the target time, then triggers
+pmset sleepnow. Sends macOS notifications for status updates.
+Writes a PID file so the user can check status or stop it.
+"""
+
+import os
+import sys
+import time
+import signal
+import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from workwatch.config import load_config, load_history, save_history
+from workwatch.mail_reader import fetch_today_emails
+from workwatch.parser import get_earliest_entry
+from workwatch.notifier import notify as _notify
+
+PID_FILE = Path.home() / ".workwatch.pid"
+LOG_FILE = Path.home() / ".workwatch.log"
+STATE_FILE = Path.home() / ".workwatch_state.json"
+RETRY_INTERVAL = 300  # 5 minutes
+
+
+def _put_to_sleep():
+    """Put the Mac to sleep."""
+    import subprocess
+    result = subprocess.run(["pmset", "sleepnow"], capture_output=True, text=True)
+    if result.returncode != 0:
+        os.system("sudo pmset sleepnow")
+
+
+def _setup_logging():
+    """Set up file-based logging for daemon mode."""
+    logging.basicConfig(
+        filename=str(LOG_FILE),
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+def _write_pid():
+    """Write the current PID to the PID file."""
+    PID_FILE.write_text(str(os.getpid()) + "\n")
+
+
+def _remove_pid():
+    """Remove the PID and state files."""
+    try:
+        PID_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+    try:
+        STATE_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _write_state(phase: str, entry_time: datetime = None, sleep_time: datetime = None):
+    """Write daemon state to a JSON file so `workwatch status` can read it."""
+    import json
+    state = {
+        "phase": phase,
+        "updated_at": datetime.now().isoformat(),
+    }
+    if entry_time:
+        state["entry_time"] = entry_time.strftime("%I:%M:%S %p")
+        state["entry_iso"] = entry_time.isoformat()
+    if sleep_time:
+        state["sleep_time"] = sleep_time.strftime("%I:%M:%S %p")
+        state["sleep_iso"] = sleep_time.isoformat()
+    STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
+
+
+def read_state() -> dict | None:
+    """Read daemon state file. Returns None if not found."""
+    import json
+    if not STATE_FILE.exists():
+        return None
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return None
+
+
+def _handle_signal(signum, frame):
+    """Handle termination signals gracefully."""
+    logging.info("Received signal %d — shutting down.", signum)
+    _remove_pid()
+    sys.exit(0)
+
+
+def get_running_pid() -> int | None:
+    """Return the PID of a running daemon, or None."""
+    if not PID_FILE.exists():
+        return None
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        # Check if process is alive
+        os.kill(pid, 0)
+        return pid
+    except (ValueError, ProcessLookupError, PermissionError):
+        _remove_pid()
+        return None
+
+
+def stop_daemon() -> bool:
+    """Stop a running daemon. Returns True if one was stopped."""
+    pid = get_running_pid()
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+        # Wait briefly for it to exit
+        for _ in range(10):
+            try:
+                os.kill(pid, 0)
+                time.sleep(0.1)
+            except ProcessLookupError:
+                break
+        _remove_pid()
+        return True
+    except ProcessLookupError:
+        _remove_pid()
+        return False
+
+
+def daemon_status() -> dict | None:
+    """Return status info about a running daemon, or None."""
+    pid = get_running_pid()
+    if pid is None:
+        return None
+
+    info = {"pid": pid}
+
+    # Try to read the log for the latest entry time / sleep time
+    if LOG_FILE.exists():
+        try:
+            lines = LOG_FILE.read_text().strip().split("\n")
+            for line in reversed(lines):
+                if "Sleep scheduled at" in line:
+                    info["status_line"] = line
+                    break
+        except Exception:
+            pass
+
+    return info
+
+
+def daemonize():
+    """Fork the process into a background daemon (Unix double-fork)."""
+    # First fork
+    pid = os.fork()
+    if pid > 0:
+        # Parent — exit and let the child continue
+        return pid
+
+    # Child — create new session
+    os.setsid()
+
+    # Second fork — prevent reacquiring a terminal
+    pid = os.fork()
+    if pid > 0:
+        os._exit(0)
+
+    # Grandchild — this is the actual daemon
+    # Redirect stdio to /dev/null
+    devnull = os.open(os.devnull, os.O_RDWR)
+    os.dup2(devnull, 0)  # stdin
+    os.dup2(devnull, 1)  # stdout
+    os.dup2(devnull, 2)  # stderr
+    os.close(devnull)
+
+    # Run the daemon loop
+    _run_daemon()
+    os._exit(0)
+
+
+def _save_record(entry_time: datetime, exit_time: datetime, hours_worked: float):
+    """Save today's attendance record to history."""
+    history = load_history()
+    date_key = datetime.now().strftime("%Y-%m-%d")
+
+    history[date_key] = {
+        "entry_time": entry_time.strftime("%I:%M:%S %p"),
+        "exit_time": exit_time.strftime("%I:%M:%S %p"),
+        "hours_worked": round(hours_worked, 2),
+    }
+
+    save_history(history)
+    logging.info("Attendance record saved.")
+
+
+def _run_daemon():
+    """Main daemon loop — runs in the forked background process."""
+    _setup_logging()
+    _write_pid()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    logging.info("WorkWatch daemon started (PID %d).", os.getpid())
+    _write_state("waiting")
+
+    config = load_config()
+    sender = config["sender"]
+    work_hours = config["work_hours"]
+
+    # Phase 1: Find the attendance email
+    retry_count = 0
+    entry_time = None
+
+    while entry_time is None:
+        success, data = fetch_today_emails(sender)
+
+        if not success:
+            logging.error("Mail error: %s", data[0] if data else "Unknown")
+            _notify("WorkWatch", "Cannot reach Mail.app. Will retry in 5 min.")
+            _write_state("waiting")
+            time.sleep(RETRY_INTERVAL)
+            continue
+
+        if not data:
+            retry_count += 1
+            logging.info("No attendance email found (attempt %d). Retrying in 5 min.", retry_count)
+            if retry_count == 1:
+                _notify("WorkWatch", "No attendance email yet. Watching in background...")
+            _write_state("waiting")
+            time.sleep(RETRY_INTERVAL)
+            continue
+
+        entry_time = get_earliest_entry(data)
+        if entry_time is None:
+            logging.error("Could not parse entry time from email body.")
+            _notify("WorkWatch Error", "Could not parse entry time from email.")
+            _remove_pid()
+            return
+
+    # Phase 2: Schedule sleep
+    sleep_time = entry_time + timedelta(hours=work_hours)
+    now = datetime.now()
+
+    entry_str = entry_time.strftime("%I:%M:%S %p")
+    sleep_str = sleep_time.strftime("%I:%M:%S %p")
+
+    logging.info("Entry time: %s", entry_str)
+    logging.info("Sleep scheduled at %s (%.1f hours)", sleep_str, work_hours)
+    _write_state("countdown", entry_time, sleep_time)
+
+    _notify(
+        "WorkWatch Active",
+        f"Entry: {entry_str} | Sleep at: {sleep_str}"
+    )
+
+    # Already past sleep time?
+    if now >= sleep_time:
+        elapsed_hours = (now - entry_time).total_seconds() / 3600
+        logging.warning("Already past sleep time! Worked %.1f hours.", elapsed_hours)
+        _notify("WorkWatch", f"Already past {sleep_str}! Sleeping now...")
+        _save_record(entry_time, now, elapsed_hours)
+        time.sleep(2)
+        _put_to_sleep()
+        _remove_pid()
+        return
+
+    # Wait until sleep time — check every 30 seconds
+    while True:
+        now = datetime.now()
+        remaining = (sleep_time - now).total_seconds()
+
+        if remaining <= 0:
+            break
+
+        # Send a 5-minute warning notification
+        if 270 < remaining <= 300:
+            _notify("WorkWatch", "5 minutes remaining before auto-sleep!")
+
+        time.sleep(min(30, remaining))
+
+    # Time's up
+    logging.info("Countdown complete. Triggering sleep.")
+    _notify("WorkWatch", "Work hours done! Putting Mac to sleep...")
+    _save_record(entry_time, sleep_time, work_hours)
+    time.sleep(3)  # Give notification time to show
+    _put_to_sleep()
+    _remove_pid()
