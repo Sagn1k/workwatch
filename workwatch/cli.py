@@ -6,7 +6,7 @@ import time
 import subprocess
 from datetime import datetime, timedelta
 
-from workwatch.config import load_config, load_history, save_history
+from workwatch.config import load_config, load_history, save_history, get_effective_work_hours
 from workwatch.mail_reader import fetch_today_emails
 from workwatch.parser import get_earliest_entry
 from workwatch.timer import (
@@ -14,10 +14,13 @@ from workwatch.timer import (
     show_waiting,
     clear_screen,
     format_time_12h,
+    render_overtime,
     VERSION,
 )
 from workwatch.log_display import show_log
 from workwatch.daemon import daemonize, stop_daemon, get_running_pid, daemon_status, read_state
+from workwatch.overtime import run_overtime_loop
+from workwatch.archiver import archive_month, previous_month
 
 
 RETRY_INTERVAL = 300  # 5 minutes
@@ -70,7 +73,6 @@ def cmd_watch(background: bool = False):
 
     config = load_config()
     sender = config["sender"]
-    work_hours = config["work_hours"]
 
     retry_count = 0
 
@@ -105,7 +107,8 @@ def cmd_watch(background: bool = False):
 
         break
 
-    # Calculate sleep time
+    # Calculate sleep time (half-day if entry is at/after 2:00 PM)
+    work_hours = get_effective_work_hours(entry_time, config)
     sleep_time = entry_time + timedelta(hours=work_hours)
     now = datetime.now()
 
@@ -131,8 +134,21 @@ def cmd_watch(background: bool = False):
     completed = run_countdown(entry_time, sleep_time)
 
     if completed:
-        hours_worked = work_hours
-        exit_time = sleep_time
+        if config.get("overtime_enabled", True):
+            threshold_min = float(config.get("inactive_threshold_minutes", 10))
+
+            def _tick(last_active, idle):
+                render_overtime(entry_time, sleep_time, last_active, idle, threshold_min)
+
+            exit_time = run_overtime_loop(
+                entry_time, sleep_time, config,
+                poll_interval=1.0,
+                on_tick=_tick,
+            )
+        else:
+            exit_time = sleep_time
+
+        hours_worked = (exit_time - entry_time).total_seconds() / 3600
         _save_record(entry_time, exit_time, hours_worked)
         time.sleep(1)
         put_to_sleep()
@@ -211,6 +227,40 @@ def cmd_status():
         print()
         return
 
+    if phase == "overtime":
+        entry_str = state.get("entry_time", "—")
+        sleep_str = state.get("sleep_time", "—")
+        entry_iso = state.get("entry_iso")
+        ot_start_iso = state.get("overtime_start_iso") or state.get("sleep_iso")
+        last_active_iso = state.get("last_active_iso")
+        idle_seconds = state.get("idle_seconds", 0)
+        today_str = datetime.now().strftime("%d/%m/%Y")
+
+        print(f"\n  \033[1;33m● OVERTIME\033[0m — tracking while active")
+        print(f"  📅 Date:        \033[1;37m{today_str}\033[0m")
+        print(f"  🕐 Entry Time:  \033[1;32m{entry_str}\033[0m")
+        print(f"  ✅ Base Done:   \033[1;32m{sleep_str}\033[0m")
+
+        if entry_iso and last_active_iso:
+            entry_dt = datetime.fromisoformat(entry_iso)
+            last_active_dt = datetime.fromisoformat(last_active_iso)
+            ot_start_dt = datetime.fromisoformat(ot_start_iso) if ot_start_iso else entry_dt
+            ot_sec = max(0, int((last_active_dt - ot_start_dt).total_seconds()))
+            total_sec = int((last_active_dt - entry_dt).total_seconds())
+            total_h = total_sec // 3600
+            total_m = (total_sec % 3600) // 60
+            total_s = total_sec % 60
+            ot_h = ot_sec // 3600
+            ot_m = (ot_sec % 3600) // 60
+            ot_s = ot_sec % 60
+            print(f"  ⏰ Overtime:    \033[1;33m+{ot_h:02d}:{ot_m:02d}:{ot_s:02d}\033[0m")
+            print(f"  🟢 Total:       \033[1;37m{total_h:02d}:{total_m:02d}:{total_s:02d}\033[0m")
+            print(f"  🎯 Last active: \033[1;37m{last_active_dt.strftime('%I:%M:%S %p')}\033[0m"
+                  f"  \033[0;90m(idle {int(idle_seconds)}s)\033[0m")
+
+        print()
+        return
+
     print(f"  \033[0;90mPhase: {phase}\033[0m\n")
 
 
@@ -243,6 +293,64 @@ def cmd_log(args: list[str]):
     show_log(year, month)
 
 
+def cmd_archive(args: list[str]):
+    """Email a month's attendance (JSON + analytics) and delete it from history."""
+    config = load_config()
+    email = config.get("archive_email", "") or ""
+    year = month = None
+    dry_run = False
+
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--month" and i + 1 < len(args):
+            try:
+                parts = args[i + 1].split("-")
+                year, month = int(parts[0]), int(parts[1])
+            except (ValueError, IndexError):
+                print(f"  \033[1;31m❌ Invalid --month format. Use YYYY-MM.\033[0m\n")
+                sys.exit(1)
+            i += 2
+            continue
+        if a == "--email" and i + 1 < len(args):
+            email = args[i + 1]
+            i += 2
+            continue
+        if a == "--dry-run":
+            dry_run = True
+            i += 1
+            continue
+        print(f"  \033[1;31m❌ Unknown argument: {a}\033[0m\n")
+        sys.exit(1)
+
+    if year is None or month is None:
+        year, month = previous_month()
+
+    if not email and not dry_run:
+        print(f"\n  \033[1;31m❌ No archive email configured.\033[0m")
+        print(f"  \033[0;90mSet 'archive_email' in ~/.workwatch.json or pass --email.\033[0m\n")
+        sys.exit(1)
+
+    label = f"{year:04d}-{month:02d}"
+    if dry_run:
+        print(f"\n  \033[1;36m⏱  Preview archive for {label}\033[0m\n")
+    else:
+        print(f"\n  \033[1;36m⏱  Archiving {label} → {email}\033[0m")
+
+    ok, msg = archive_month(year, month, email, dry_run=dry_run)
+    if not ok:
+        print(f"\n  \033[1;31m❌ {msg}\033[0m\n")
+        sys.exit(1)
+
+    if dry_run:
+        print("  \033[0;90m--- email body ---\033[0m")
+        print(msg)
+        print("  \033[0;90m--- end ---\033[0m\n")
+        return
+
+    print(f"  \033[1;32m✅ {msg}\033[0m\n")
+
+
 def cmd_version():
     """Show version."""
     print(f"WorkWatch v{VERSION}")
@@ -261,6 +369,9 @@ def cmd_help():
   workwatch log          Show monthly attendance log
   workwatch log --month YYYY-MM
                          Show log for a specific month
+  workwatch archive      Email + delete last month's records
+  workwatch archive --month YYYY-MM [--email addr] [--dry-run]
+                         Archive a specific month (or preview)
   workwatch version      Show version
   workwatch help         Show this help message
 
@@ -291,6 +402,8 @@ def main():
         cmd_stop()
     elif args[0] == "log":
         cmd_log(args[1:])
+    elif args[0] == "archive":
+        cmd_archive(args[1:])
     elif args[0] == "version":
         cmd_version()
     elif args[0] in ("help", "--help", "-h"):

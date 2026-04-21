@@ -13,10 +13,11 @@ import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from workwatch.config import load_config, load_history, save_history
+from workwatch.config import load_config, load_history, save_history, get_effective_work_hours
 from workwatch.mail_reader import fetch_today_emails
 from workwatch.parser import get_earliest_entry
 from workwatch.notifier import notify as _notify
+from workwatch.overtime import run_overtime_loop
 
 PID_FILE = Path.home() / ".workwatch.pid"
 LOG_FILE = Path.home() / ".workwatch.log"
@@ -59,7 +60,9 @@ def _remove_pid():
         pass
 
 
-def _write_state(phase: str, entry_time: datetime = None, sleep_time: datetime = None):
+def _write_state(phase: str, entry_time: datetime = None, sleep_time: datetime = None,
+                 overtime_start: datetime = None, last_active: datetime = None,
+                 idle_seconds: float = None):
     """Write daemon state to a JSON file so `workwatch status` can read it."""
     import json
     state = {
@@ -72,6 +75,13 @@ def _write_state(phase: str, entry_time: datetime = None, sleep_time: datetime =
     if sleep_time:
         state["sleep_time"] = sleep_time.strftime("%I:%M:%S %p")
         state["sleep_iso"] = sleep_time.isoformat()
+    if overtime_start:
+        state["overtime_start_iso"] = overtime_start.isoformat()
+    if last_active:
+        state["last_active_iso"] = last_active.isoformat()
+        state["last_active"] = last_active.strftime("%I:%M:%S %p")
+    if idle_seconds is not None:
+        state["idle_seconds"] = round(idle_seconds, 1)
     STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
 
 
@@ -207,7 +217,6 @@ def _run_daemon():
 
     config = load_config()
     sender = config["sender"]
-    work_hours = config["work_hours"]
 
     # Phase 1: Find the attendance email
     retry_count = 0
@@ -239,7 +248,8 @@ def _run_daemon():
             _remove_pid()
             return
 
-    # Phase 2: Schedule sleep
+    # Phase 2: Schedule sleep (half-day if entry is at/after 2:00 PM)
+    work_hours = get_effective_work_hours(entry_time, config)
     sleep_time = entry_time + timedelta(hours=work_hours)
     now = datetime.now()
 
@@ -280,10 +290,39 @@ def _run_daemon():
 
         time.sleep(min(30, remaining))
 
-    # Time's up
-    logging.info("Countdown complete. Triggering sleep.")
-    _notify("WorkWatch", "Work hours done! Putting Mac to sleep...")
-    _save_record(entry_time, sleep_time, work_hours)
+    # Countdown complete — enter overtime phase if enabled
+    logging.info("Countdown complete.")
+
+    if config.get("overtime_enabled", True):
+        threshold_min = float(config.get("inactive_threshold_minutes", 10))
+        _notify("WorkWatch", "Work hours done. Tracking overtime while you're active...")
+        _write_state("overtime", entry_time, sleep_time,
+                     overtime_start=sleep_time, last_active=sleep_time, idle_seconds=0)
+
+        def _ot_tick(last_active, idle):
+            _write_state("overtime", entry_time, sleep_time,
+                         overtime_start=sleep_time,
+                         last_active=last_active, idle_seconds=idle)
+
+        exit_time = run_overtime_loop(
+            entry_time, sleep_time, config,
+            poll_interval=30.0,
+            on_tick=_ot_tick,
+        )
+        ot_minutes = max(0, (exit_time - sleep_time).total_seconds() / 60)
+        logging.info("Overtime ended. OT: %.1f min. Exit: %s",
+                     ot_minutes, exit_time.strftime("%I:%M:%S %p"))
+        _notify(
+            "WorkWatch",
+            f"Inactive {int(threshold_min)} min. Ending day at "
+            f"{exit_time.strftime('%I:%M %p')}, sleeping...",
+        )
+    else:
+        exit_time = sleep_time
+        _notify("WorkWatch", "Work hours done! Putting Mac to sleep...")
+
+    hours_worked = (exit_time - entry_time).total_seconds() / 3600
+    _save_record(entry_time, exit_time, hours_worked)
     time.sleep(3)  # Give notification time to show
     _put_to_sleep()
     _remove_pid()
