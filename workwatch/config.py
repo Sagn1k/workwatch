@@ -1,15 +1,29 @@
 """Configuration and history file management for WorkWatch."""
 
 import json
+from datetime import datetime, time
 from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".workwatch.json"
 HISTORY_PATH = Path.home() / ".workwatch_history.json"
 
+HALF_DAY_CUTOFF = time(14, 0)
+
 DEFAULT_CONFIG = {
     "work_hours": 9,
+    "half_day_hours": 4.5,
     "sender": "attendance@vmock.com",
+    "overtime_enabled": True,
+    "inactive_threshold_minutes": 10,
+    "archive_email": "",
 }
+
+
+def get_effective_work_hours(entry_time: datetime, config: dict) -> float:
+    """Return half_day_hours if entry is at/after 2:00 PM, else work_hours."""
+    if entry_time.time() >= HALF_DAY_CUTOFF:
+        return config["half_day_hours"]
+    return config["work_hours"]
 
 
 def load_config() -> dict:
@@ -23,9 +37,14 @@ def load_config() -> dict:
     with open(CONFIG_PATH) as f:
         config = json.load(f)
 
-    # Merge with defaults for any missing keys
+    # Merge with defaults for any missing keys, and persist additions
+    # so the on-disk file stays in sync with DEFAULT_CONFIG.
+    missing = [k for k in DEFAULT_CONFIG if k not in config]
     for key, value in DEFAULT_CONFIG.items():
         config.setdefault(key, value)
+    if missing:
+        CONFIG_PATH.write_text(json.dumps(config, indent=2) + "\n")
+        print(f"📄 Added new config keys to {CONFIG_PATH}: {', '.join(missing)}")
 
     return config
 

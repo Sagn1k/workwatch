@@ -64,8 +64,12 @@ Installs `workwatch` as a Python package. Edits to the source take effect immedi
 git clone https://github.com/sagnikb7/workwatch.git
 cd workwatch
 make build
-sudo cp dist/workwatch /usr/local/bin/
+sudo rm -f /usr/local/bin/workwatch
+sudo ditto dist/workwatch /usr/local/bin/workwatch   # ditto preserves the code signature; cp breaks it on macOS 26+
+sudo chown $USER:staff /usr/local/bin/workwatch
 ```
+
+> `make install` runs these three commands for you (it will prompt for `sudo`).
 
 ### Verify
 
@@ -126,6 +130,27 @@ Color-coded table with entry/exit times, hours worked, and a monthly summary:
 | Red | Under 9 hours (short) |
 | Gray | Weekend / no data |
 
+### Monthly Archive (email + purge)
+
+```bash
+workwatch archive                         # emails last month, deletes those entries
+workwatch archive --month 2026-02         # specific month
+workwatch archive --email me@example.com  # override configured address
+workwatch archive --dry-run               # preview the email body, send nothing
+```
+
+Sends the month's records as an **HTML email** (color-coded analytics badges at the top, a daily log table below) with a nicely-formatted plain-text fallback, through **Mail.app** (same account stack as the attendance reader — no SMTP setup needed). Before deleting from `~/.workwatch_history.json`, a snapshot is written to `~/.workwatch_archives/YYYY-MM.{json,html}` as a safety net in case email delivery silently fails.
+
+Analytics included: month, working days, total hours, average/day, longest day, shortest day, overtime day count + total OT hours, short/half-day count. Each row is tagged with a color level (🟢 good / 🟡 warn / 🔴 bad / ⭐ primary / 🔵 info).
+
+Each daily log row shows Date, Day, Entry, Exit, Hours, Overtime, and a status badge (Full / Short / Half).
+
+Schedule via cron to run automatically on the 1st of each month:
+
+```cron
+0 9 1 * * /usr/local/bin/workwatch archive >> ~/.workwatch.log 2>&1
+```
+
 ### Command Reference
 
 | Command | Description |
@@ -136,6 +161,8 @@ Color-coded table with entry/exit times, hours worked, and a monthly summary:
 | `workwatch stop` | Stop background daemon |
 | `workwatch log` | Show current month's attendance log |
 | `workwatch log --month YYYY-MM` | Show log for a specific month |
+| `workwatch archive` | Email last month's records + analytics to `archive_email`, then delete |
+| `workwatch archive --month YYYY-MM [--email addr] [--dry-run]` | Archive a specific month (or preview) |
 | `workwatch version` | Print version |
 | `workwatch help` | Show help text |
 
@@ -146,14 +173,21 @@ Config file: `~/.workwatch.json` (auto-created on first run)
 ```json
 {
   "work_hours": 9,
-  "sender": "attendance@vmock.com"
+  "half_day_hours": 4.5,
+  "sender": "attendance@vmock.com",
+  "overtime_enabled": true,
+  "inactive_threshold_minutes": 10
 }
 ```
 
 | Key | Description | Default |
 |-----|-------------|---------|
 | `work_hours` | Hours to work before auto-sleep (supports decimals like `8.5`) | `9` |
+| `half_day_hours` | Hours to work when entry is at/after 2:00 PM (half-day) | `4.5` |
 | `sender` | Email address to search for in Mail.app | `attendance@vmock.com` |
+| `overtime_enabled` | After countdown ends, keep tracking while you're active instead of sleeping immediately | `true` |
+| `inactive_threshold_minutes` | Minutes of keyboard/mouse idle that ends overtime and triggers sleep | `10` |
+| `archive_email` | Destination address for `workwatch archive` monthly emails (leave blank to require `--email`) | `""` |
 
 ## Files
 
@@ -164,6 +198,8 @@ Config file: `~/.workwatch.json` (auto-created on first run)
 | `~/.workwatch.log` | Daemon log (background mode only) |
 | `~/.workwatch.pid` | Daemon PID file (background mode only) |
 | `~/.workwatch_state.json` | Daemon state (inter-process, auto-managed) |
+| `~/.workwatch_archives/YYYY-MM.json` | Local JSON backup written by `workwatch archive` before deleting from history |
+| `~/.workwatch_archives/YYYY-MM.html` | Local HTML rendering of the email body (open in a browser to re-view) |
 
 ## How It Works
 
@@ -171,10 +207,13 @@ Config file: `~/.workwatch.json` (auto-created on first run)
 2. Uses Mail.app's native `whose` filtering by sender and date for fast lookups
 3. Parses "Entry Allowed" timestamps from email bodies using regex
 4. If multiple entry emails exist, uses the earliest (first check-in)
-5. Calculates sleep time = earliest entry + configured work hours
+5. Calculates sleep time = earliest entry + work hours (uses `half_day_hours` if entry is at/after 2:00 PM, else `work_hours`)
 6. **Foreground**: live terminal countdown &nbsp;|&nbsp; **Background**: silent daemon with macOS notifications
-7. When the countdown hits zero, saves the attendance record to `~/.workwatch_history.json`
-8. Triggers `pmset sleepnow` to put the Mac to sleep
+7. When the countdown hits zero:
+   - If `overtime_enabled` (default): enters overtime tracking — polls the macOS HID idle counter (`ioreg -c IOHIDSystem`) and keeps logging hours while you're active. When keyboard/mouse has been idle for `inactive_threshold_minutes` (default 10), the last-active moment becomes the exit time.
+   - Otherwise: exit time = scheduled sleep time.
+8. Saves the attendance record to `~/.workwatch_history.json` with `hours_worked` = `(exit_time − entry_time)` (base + OT folded in)
+9. Triggers `pmset sleepnow` to put the Mac to sleep
 
 ## Building & Releasing
 

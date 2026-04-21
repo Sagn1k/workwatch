@@ -96,6 +96,36 @@ def run_countdown(entry_time: datetime, sleep_time: datetime) -> bool:
         return False
 
 
+def render_overtime(entry_time: datetime, scheduled_sleep: datetime,
+                    last_active: datetime, idle_seconds: float,
+                    threshold_minutes: float):
+    """Render the overtime-tracking screen (replaces countdown after it ends)."""
+    clear_screen()
+    today_str = datetime.now().strftime("%d/%m/%Y")
+    entry_str = format_time_12h(entry_time)
+    base_done_str = format_time_12h(scheduled_sleep)
+    last_active_str = format_time_12h(last_active)
+
+    ot_seconds = max(0, int((last_active - scheduled_sleep).total_seconds()))
+    idle_int = int(idle_seconds)
+    grace_remaining = max(0, int(threshold_minutes * 60) - idle_int)
+
+    print(f"\033[1;36m╔══════════════════════════════════════════╗\033[0m")
+    print(f"\033[1;36m║\033[0m          \033[1;37m⏱  WorkWatch v{VERSION}\033[0m              \033[1;36m║\033[0m")
+    print(f"\033[1;36m║\033[0m   \033[0;37mOvertime — tracking while active\033[0m       \033[1;36m║\033[0m")
+    print(f"\033[1;36m╚══════════════════════════════════════════╝\033[0m")
+    print()
+    print(f"  📅 Date:        \033[1;37m{today_str}\033[0m")
+    print(f"  🕐 Entry Time:  \033[1;32m{entry_str}\033[0m")
+    print(f"  ✅ Base Done:   \033[1;32m{base_done_str}\033[0m")
+    print(f"  ⏰ Overtime:    \033[1;33m+{format_duration(ot_seconds)}\033[0m")
+    print(f"  🎯 Last active: \033[1;37m{last_active_str}\033[0m  \033[0;90m(idle {format_duration(idle_int)})\033[0m")
+    print(f"  \033[0;90m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m")
+    print(f"  \033[0;90mIdle {int(threshold_minutes)} min → save record & sleep "
+          f"(grace: {format_duration(grace_remaining)})\033[0m")
+    print(f"  \033[0;90mPress Ctrl+C to end now\033[0m")
+
+
 def show_waiting(retry_count: int, next_retry: datetime):
     """Show the waiting-for-email screen."""
     clear_screen()
