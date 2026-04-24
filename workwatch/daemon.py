@@ -192,7 +192,10 @@ def daemonize():
 def _save_record(entry_time: datetime, exit_time: datetime, hours_worked: float):
     """Save today's attendance record to history."""
     history = load_history()
-    date_key = datetime.now().strftime("%Y-%m-%d")
+    # Key the record by the day the user started work, not by "now". Overtime
+    # routinely crosses midnight (laptop left asleep overnight), so using the
+    # save-time date would land the row on the wrong day.
+    date_key = entry_time.strftime("%Y-%m-%d")
 
     history[date_key] = {
         "entry_time": entry_time.strftime("%I:%M:%S %p"),
