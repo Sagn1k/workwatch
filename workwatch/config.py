@@ -15,7 +15,15 @@ DEFAULT_CONFIG = {
     "sender": "attendance@vmock.com",
     "overtime_enabled": True,
     "inactive_threshold_minutes": 10,
+    "give_up_after": "16:00",     # stop waiting for the attendance mail past
+                                  # this local time (leave/holiday) and exit
     "archive_email": "",
+    # `recap` command settings ----------------------------------------
+    "recap_repos": [],            # explicit dirs to scan (do NOT auto-scan $HOME)
+    "recap_author": "",           # git --author filter; "" → git config user.email
+    "recap_default_window": "24h",
+    "recap_include_claude": True,  # include the Claude Code "Explored" bucket
+    "recap_ai_review": False,      # reserved: Claude-API verdict instead of rules
 }
 
 

@@ -351,6 +351,112 @@ def cmd_archive(args: list[str]):
     print(f"  \033[1;32m✅ {msg}\033[0m\n")
 
 
+def cmd_recap(args: list[str]):
+    """Time-windowed 'what I did' summary (git + Claude sessions), emailed."""
+    from workwatch.recap import run_recap
+
+    config = load_config()
+    window = config.get("recap_default_window", "24h")
+    email = config.get("archive_email", "") or ""
+    author = config.get("recap_author", "") or ""
+    include_claude = config.get("recap_include_claude", True)
+    repos: list[str] = []
+    dry_run = False
+    full = False
+
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--email" and i + 1 < len(args):
+            email = args[i + 1]
+            i += 2
+            continue
+        if a == "--repo" and i + 1 < len(args):
+            repos.append(args[i + 1])
+            i += 2
+            continue
+        if a == "--dry-run":
+            dry_run = True
+            i += 1
+            continue
+        if a == "--no-claude":
+            include_claude = False
+            i += 1
+            continue
+        if a in ("--full", "--all"):
+            full = True
+            i += 1
+            continue
+        if not a.startswith("-"):
+            window = a
+            i += 1
+            continue
+        print(f"  \033[1;31m❌ Unknown argument: {a}\033[0m\n")
+        sys.exit(1)
+
+    if not repos:
+        repos = [os.path.expanduser(p) for p in config.get("recap_repos", []) or []]
+
+    if not repos:
+        print(f"\n  \033[1;31m❌ No repos to scan.\033[0m")
+        print(f"  \033[0;90mSet 'recap_repos' in ~/.workwatch.json or pass --repo DIR.\033[0m\n")
+        sys.exit(1)
+
+    if not email and not dry_run:
+        print(f"\n  \033[1;31m❌ No recipient email configured.\033[0m")
+        print(f"  \033[0;90mSet 'archive_email' in ~/.workwatch.json or pass --email.\033[0m\n")
+        sys.exit(1)
+
+    if dry_run:
+        print(f"\n  \033[1;36m⏱  Recap preview (last {window})\033[0m\n")
+    else:
+        print(f"\n  \033[1;36m⏱  Building recap (last {window}) → {email}\033[0m")
+
+    ok, msg = run_recap(window, repos, author, email,
+                        dry_run=dry_run, include_claude=include_claude, full=full)
+    if not ok:
+        print(f"\n  \033[1;31m❌ {msg}\033[0m\n")
+        sys.exit(1)
+
+    if dry_run:
+        print(msg)
+        print()
+        return
+
+    print(f"  \033[1;32m✅ {msg}\033[0m\n")
+
+
+def cmd_install_agent():
+    """Install the launchd agent so the daemon auto-starts on workdays."""
+    from workwatch.launch_agent import (
+        install, PLIST_PATH, START_HOUR, START_MINUTE,
+    )
+
+    ok, info = install()
+    if not ok:
+        print(f"\n  \033[1;31m❌ {info}\033[0m\n")
+        sys.exit(1)
+
+    when = f"{START_HOUR:02d}:{START_MINUTE:02d}"
+    print(f"\n  \033[1;32m✅ Auto-start installed.\033[0m")
+    print(f"  \033[0;90mBinary:\033[0m   {info}")
+    print(f"  \033[0;90mSchedule:\033[0m Mon–Fri at {when}, plus every login/boot")
+    print(f"  \033[0;90mPlist:\033[0m    {PLIST_PATH}")
+    print(f"\n  \033[0;90mThe daemon will now start itself each workday and wait for")
+    print(f"  your attendance mail. Remove with: workwatch uninstall-agent\033[0m\n")
+
+
+def cmd_uninstall_agent():
+    """Remove the launchd auto-start agent."""
+    from workwatch.launch_agent import uninstall
+
+    ok, info = uninstall()
+    if ok:
+        print(f"\n  \033[1;32m✅ Auto-start removed.\033[0m \033[0;90m({info})\033[0m\n")
+    else:
+        print(f"\n  \033[0;90m{info}\033[0m\n")
+
+
 def cmd_version():
     """Show version."""
     print(f"WorkWatch v{VERSION}")
@@ -372,12 +478,27 @@ def cmd_help():
   workwatch archive      Email + delete last month's records
   workwatch archive --month YYYY-MM [--email addr] [--dry-run]
                          Archive a specific month (or preview)
+  workwatch recap [WINDOW] [--repo DIR] [--email addr] [--dry-run]
+                          [--no-claude] [--full]
+                         "What I did" summary (git + Claude sessions), emailed.
+                         WINDOW: 24h (default), 90m, 7d, 2w, 1mo
+                         --full: list everything (all commits/sessions/idle
+                                 repos), no "+N more" truncation
+  workwatch install-agent
+                         Auto-start the daemon on workdays (Mon–Fri 8 AM
+                         + every login) via a macOS LaunchAgent
+  workwatch uninstall-agent
+                         Remove the auto-start LaunchAgent
   workwatch version      Show version
   workwatch help         Show this help message
 
 \033[1;37mBackground mode:\033[0m
   Runs silently, sends macOS notifications, sleeps Mac when done.
   Log: ~/.workwatch.log | PID: ~/.workwatch.pid
+
+\033[1;37mAuto-start:\033[0m
+  workwatch install-agent   → runs itself each workday, no terminal needed
+  Give-up time for leave days: 'give_up_after' in ~/.workwatch.json
 
 \033[1;37mConfig:\033[0m
   ~/.workwatch.json      Edit work_hours and sender email
@@ -404,6 +525,12 @@ def main():
         cmd_log(args[1:])
     elif args[0] == "archive":
         cmd_archive(args[1:])
+    elif args[0] == "recap":
+        cmd_recap(args[1:])
+    elif args[0] == "install-agent":
+        cmd_install_agent()
+    elif args[0] == "uninstall-agent":
+        cmd_uninstall_agent()
     elif args[0] == "version":
         cmd_version()
     elif args[0] in ("help", "--help", "-h"):
