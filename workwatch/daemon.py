@@ -195,6 +195,7 @@ def _save_record(entry_time: datetime, exit_time: datetime, hours_worked: float)
     history = load_history()
     # Key by the ENTRY date, not now(): a late entry whose hours cross midnight
     # must still be filed under the day it started.
+
     date_key = entry_time.strftime("%Y-%m-%d")
 
     history[date_key] = {
